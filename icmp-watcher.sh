@@ -23,7 +23,8 @@ LOCKFILE="/tmp/icmp.monitor.lock.pid"
 ISOLATE_TIME_SEC=300
 WIDTH=520
 TITLE="Sonar Ping Detected"
-ISO_CHAIN="ICMP_WATCHER_ISOLATE"
+ISO_CHAIN_IN="ICMP_WATCHER_ISO_IN"
+ISO_CHAIN_OUT="ICMP_WATCHER_ISO_OUT"
 
 #---------------------------------------------------------------------------
 # USER / DISPLAY CONTEXT
@@ -130,15 +131,21 @@ lock_release(){
 #---------------------------------------------------------------------------
 remove_iso_chain(){
     for cmd in iptables ip6tables; do
-        # Detach from all possible hooks (cleanup old versions too)
-        for hook in INPUT FORWARD OUTPUT PREROUTING; do
-            for chain in "${ISO_CHAIN}" "ICMP_WATCHER_ISO_IN" "ICMP_WATCHER_ISO_OUT"; do
-                sudo -n $cmd -D $hook -j "${chain}" 2>/dev/null
-                sudo -n $cmd -t raw -D $hook -j "${chain}" 2>/dev/null
-            done
+        # Detach from all possible hooks
+        for hook in INPUT FORWARD PREROUTING; do
+            sudo -n $cmd -D $hook -j "${ISO_CHAIN_IN}" 2>/dev/null
+            sudo -n $cmd -t raw -D $hook -j "${ISO_CHAIN_IN}" 2>/dev/null
         done
+        sudo -n $cmd -D OUTPUT -j "${ISO_CHAIN_OUT}" 2>/dev/null
+
+        # Detach from legacy hooks if any
+        sudo -n $cmd -D INPUT -j "ICMP_WATCHER_ISOLATE" 2>/dev/null
+        sudo -n $cmd -D FORWARD -j "ICMP_WATCHER_ISOLATE" 2>/dev/null
+        sudo -n $cmd -D OUTPUT -j "ICMP_WATCHER_ISOLATE" 2>/dev/null
+        sudo -n $cmd -t raw -D PREROUTING -j "ICMP_WATCHER_ISOLATE" 2>/dev/null
+
         # Delete the chains
-        for chain in "${ISO_CHAIN}" "ICMP_WATCHER_ISO_IN" "ICMP_WATCHER_ISO_OUT"; do
+        for chain in "${ISO_CHAIN_IN}" "${ISO_CHAIN_OUT}" "ICMP_WATCHER_ISOLATE"; do
             sudo -n $cmd -F "${chain}" 2>/dev/null
             sudo -n $cmd -X "${chain}" 2>/dev/null
             sudo -n $cmd -t raw -F "${chain}" 2>/dev/null
@@ -148,24 +155,26 @@ remove_iso_chain(){
 }
 init_iso_chain(){
     remove_iso_chain
+    sudo rm -f "${IGNORE_IP_LIST}"
     mkdir -p "${ISOLATE_MARKER_DIR}"
     for cmd in iptables ip6tables; do
-        # Create chain in 'filter' table for standard dropping
-        sudo -n $cmd -N "${ISO_CHAIN}"
-        # Hook to all major chains to ensure coverage of both kernel and local processes (Ettercap)
-        sudo -n $cmd -I INPUT 1 -j "${ISO_CHAIN}"
-        sudo -n $cmd -I FORWARD 1 -j "${ISO_CHAIN}"
-        sudo -n $cmd -I OUTPUT 1 -j "${ISO_CHAIN}"
+        # Inbound chain for PREROUTING, INPUT, FORWARD (where MAC matching is allowed)
+        sudo -n $cmd -N "${ISO_CHAIN_IN}"
+        sudo -n $cmd -t raw -N "${ISO_CHAIN_IN}"
+        sudo -n $cmd -I INPUT 1 -j "${ISO_CHAIN_IN}"
+        sudo -n $cmd -I FORWARD 1 -j "${ISO_CHAIN_IN}"
+        sudo -n $cmd -t raw -I PREROUTING 1 -j "${ISO_CHAIN_IN}"
 
-        # Also hook to PREROUTING in 'raw' table for early dropping
-        sudo -n $cmd -t raw -N "${ISO_CHAIN}"
-        sudo -n $cmd -t raw -I PREROUTING 1 -j "${ISO_CHAIN}"
+        # Outbound chain for OUTPUT (where MAC matching is NOT allowed)
+        sudo -n $cmd -N "${ISO_CHAIN_OUT}"
+        sudo -n $cmd -I OUTPUT 1 -j "${ISO_CHAIN_OUT}"
     done
 }
 cleanup(){
 	sudo -n pkill -INT -f "ettercap.*-M arp" 2>/dev/null
 	remove_iso_chain
 	sudo -n rm -rf "${ISOLATE_MARKER_DIR}" 2>/dev/null
+	sudo -n rm -f "${IGNORE_IP_LIST}" 2>/dev/null
 	sudo -n rm -f /tmp/etter.*.filter /tmp/etter.*.ef 2>/dev/null
 	[ -n "${ORIG_IP_FORWARD}" ] && echo "${ORIG_IP_FORWARD}" | sudo -n tee /proc/sys/net/ipv4/ip_forward >/dev/null 2>&1
 	[ -n "${ORIG_ICMP_IGNORE}" ] && echo "${ORIG_ICMP_IGNORE}" | sudo -n tee /proc/sys/net/ipv4/icmp_echo_ignore_all >/dev/null 2>&1
@@ -195,86 +204,90 @@ popup_and_act(){
 			--title="${TITLE}" \
 			--width=${WIDTH} \
 			--text="Ping from: ${IP}\nNetcard: ${NETCARD}\n\nSelect action:" \
-			--ok-label="No action" \
-			--cancel-label="Cancel" \
+			--extra-button="Isolate ${IP}" \
+			--extra-button="Block ${IP}" \
+			--extra-button="Stop monitoring ${IP}" \
 			--extra-button="Ignore" \
-			--extra-button="Block" \
-			--extra-button="Isolate" \
 			--extra-button="Change IP" \
-			--extra-button="Go Offline" \
-			--extra-button="Stop Monitoring")"
+			--ok-label="Go Offline" \
+			--cancel-label="Cancel")"
 	else
 		answer="$(zenity_u --question \
 			--title="${TITLE}" \
 			--width=${WIDTH} \
 			--text="Ping from: ${IP}\nNetcard: ${NETCARD}\n\nSelect action:" \
-			--ok-label="No action" \
-			--cancel-label="Cancel" \
-			--extra-button="Block" \
+			--extra-button="Block ${IP}" \
+			--extra-button="Stop monitoring ${IP}" \
 			--extra-button="Change IP" \
-			--extra-button="Go Offline" \
-			--extra-button="Stop Monitoring")"
+			--ok-label="Go Offline" \
+			--cancel-label="Cancel")"
+	fi
+
+	# Handle OK button (Zenity returns exit code 0 and empty stdout for OK)
+	if [ $? -eq 0 ] && [ -z "${answer}" ]; then
+		answer="Go Offline"
 	fi
 
 	case "${answer}" in
 		"Ignore")
 			[ "${same_net}" -eq 1 ] && echo "${IP}" | sudo -n tee -a "${IGNORE_IP_LIST}" >/dev/null
 			;;
-		"Block")
+		"Block ${IP}")
 			validate_netcard
 			sudo -n iptables -C INPUT -i "${NETCARD}" -s "${IP}" -j DROP 2>/dev/null || \
 			sudo -n iptables -I INPUT 1 -i "${NETCARD}" -s "${IP}" -j DROP
 			;;
-		"Isolate")
+		"Isolate ${IP}")
 			if [ "${same_net}" -eq 1 ]; then
 				validate_netcard
 				GW=$(get_gateway)
-				# Ensure only one isolation per IP
 				sudo -n pkill -INT -f "ettercap.*-M arp.*${IP}" 2>/dev/null
-
-				# Get MAC address of target
 				TARGET_MAC=$(ip neighbor show "${IP}" | awk '{print $5}' | grep -i '[0-9a-f:]\{17\}' | head -n1)
+
+				# Create ettercap filter to drop packets and avoid 'Operation not permitted' errors in log
+				FILTER_SRC="/tmp/etter.${IP}.filter"
+				FILTER_BIN="/tmp/etter.${IP}.ef"
+				cat <<EOF > "${FILTER_SRC}"
+if (ip.src == '${IP}' || ip.dst == '${IP}') {
+    drop();
+}
+EOF
+				sudo -n etterfilter "${FILTER_SRC}" -o "${FILTER_BIN}" >/dev/null 2>&1
 
 				touch "${ISOLATE_MARKER_DIR}/${IP}"
 				(
 					trap - EXIT INT TERM
 					cleanup(){ :; }
-
-					# Triple-layer blocking: raw table, filter table (INPUT/FORWARD/OUTPUT).
-					# OUTPUT is needed because Ettercap forwards captured packets via local raw sockets.
-					# Errors (EPERM) from Ettercap re-injection are normal during isolation.
-					sudo -n iptables -t raw -A "${ISO_CHAIN}" -s "${IP}" -j DROP
-					sudo -n iptables -t raw -A "${ISO_CHAIN}" -d "${IP}" -j DROP
-					sudo -n iptables -A "${ISO_CHAIN}" -s "${IP}" -j DROP
-					sudo -n iptables -A "${ISO_CHAIN}" -d "${IP}" -j DROP
+					sudo -n iptables -t raw -A "${ISO_CHAIN_IN}" -s "${IP}" -j DROP
+					sudo -n iptables -A "${ISO_CHAIN_IN}" -s "${IP}" -j DROP
 					[ -n "${TARGET_MAC}" ] && {
-						sudo -n iptables -t raw -A "${ISO_CHAIN}" -m mac --mac-source "${TARGET_MAC}" -j DROP
-						sudo -n iptables -A "${ISO_CHAIN}" -m mac --mac-source "${TARGET_MAC}" -j DROP
-						sudo -n ip6tables -t raw -A "${ISO_CHAIN}" -m mac --mac-source "${TARGET_MAC}" -j DROP
-						sudo -n ip6tables -A "${ISO_CHAIN}" -m mac --mac-source "${TARGET_MAC}" -j DROP
+						sudo -n iptables -t raw -A "${ISO_CHAIN_IN}" -m mac --mac-source "${TARGET_MAC}" -j DROP
+						sudo -n iptables -A "${ISO_CHAIN_IN}" -m mac --mac-source "${TARGET_MAC}" -j DROP
+						sudo -n ip6tables -t raw -A "${ISO_CHAIN_IN}" -m mac --mac-source "${TARGET_MAC}" -j DROP
+						sudo -n ip6tables -A "${ISO_CHAIN_IN}" -m mac --mac-source "${TARGET_MAC}" -j DROP
 					}
+					sudo -n iptables -A "${ISO_CHAIN_OUT}" -d "${IP}" -j DROP
 
 					echo "<5>icmp-watcher: Starting isolation of ${IP} (MAC: ${TARGET_MAC}, Gateway: ${GW}) on ${NETCARD}" | sudo -n tee /dev/kmsg >/dev/null 2>&1
 
-					# MITM with ARP poisoning. Stdin from /dev/null is CRITICAL to prevent Ettercap crash.
-					# Stderr is captured in debug log if enabled.
+					# Run ettercap with the filter (-F) to prevent forwarding blocked traffic
 					if [ "$DEBUG" -eq 1 ]; then
-						sudo -n timeout -s INT ${ISOLATE_TIME_SEC} ettercap -T -M arp /${IP}// /${GW}// < /dev/null >> "$DEBUG_LOG" 2>&1
+						sudo -n timeout -s INT ${ISOLATE_TIME_SEC} ettercap -T -q -F "${FILTER_BIN}" -M arp -i "${NETCARD}" /${IP}// /${GW}// < /dev/null >> "$DEBUG_LOG" 2>&1
 					else
-						sudo -n timeout -s INT ${ISOLATE_TIME_SEC} ettercap -T -M arp /${IP}// /${GW}// < /dev/null >/dev/null 2>&1
+						sudo -n timeout -s INT ${ISOLATE_TIME_SEC} ettercap -T -q -F "${FILTER_BIN}" -M arp -i "${NETCARD}" /${IP}// /${GW}// < /dev/null >/dev/null 2>&1
 					fi
 
-					# Cleanup rules for this specific IP
-					sudo -n iptables -t raw -D "${ISO_CHAIN}" -s "${IP}" -j DROP 2>/dev/null
-					sudo -n iptables -t raw -D "${ISO_CHAIN}" -d "${IP}" -j DROP 2>/dev/null
-					sudo -n iptables -D "${ISO_CHAIN}" -s "${IP}" -j DROP 2>/dev/null
-					sudo -n iptables -D "${ISO_CHAIN}" -d "${IP}" -j DROP 2>/dev/null
+					# Cleanup
+					sudo -n iptables -t raw -D "${ISO_CHAIN_IN}" -s "${IP}" -j DROP 2>/dev/null
+					sudo -n iptables -D "${ISO_CHAIN_IN}" -s "${IP}" -j DROP 2>/dev/null
 					[ -n "${TARGET_MAC}" ] && {
-						sudo -n iptables -t raw -D "${ISO_CHAIN}" -m mac --mac-source "${TARGET_MAC}" -j DROP 2>/dev/null
-						sudo -n iptables -D "${ISO_CHAIN}" -m mac --mac-source "${TARGET_MAC}" -j DROP 2>/dev/null
-						sudo -n ip6tables -t raw -D "${ISO_CHAIN}" -m mac --mac-source "${TARGET_MAC}" -j DROP 2>/dev/null
-						sudo -n ip6tables -D "${ISO_CHAIN}" -m mac --mac-source "${TARGET_MAC}" -j DROP 2>/dev/null
+						sudo -n iptables -t raw -D "${ISO_CHAIN_IN}" -m mac --mac-source "${TARGET_MAC}" -j DROP 2>/dev/null
+						sudo -n iptables -D "${ISO_CHAIN_IN}" -m mac --mac-source "${TARGET_MAC}" -j DROP 2>/dev/null
+						sudo -n ip6tables -t raw -D "${ISO_CHAIN_IN}" -m mac --mac-source "${TARGET_MAC}" -j DROP 2>/dev/null
+						sudo -n ip6tables -D "${ISO_CHAIN_IN}" -m mac --mac-source "${TARGET_MAC}" -j DROP 2>/dev/null
 					}
+					sudo -n iptables -D "${ISO_CHAIN_OUT}" -d "${IP}" -j DROP 2>/dev/null
+					sudo rm -f "${FILTER_SRC}" "${FILTER_BIN}"
 					rm -f "${ISOLATE_MARKER_DIR}/${IP}"
 					echo "<5>icmp-watcher: Stopped isolation of ${IP} on ${NETCARD}" | sudo -n tee /dev/kmsg >/dev/null 2>&1
 				) &
@@ -289,7 +302,7 @@ popup_and_act(){
 		"Go Offline")
 			sudo -n nmcli networking off
 			;;
-		"Stop Monitoring")
+		"Stop monitoring ${IP}")
 			exit 0
 			;;
 	esac
