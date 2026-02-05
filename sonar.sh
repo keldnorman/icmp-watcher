@@ -16,6 +16,9 @@ if [ -t 1 ]; then clear; fi # Clear screen if we have a console
 # (C)opyleft 2025 - Keld Norman
 #
 # Add this to crontab to ensure the sonar script is running.
+#------------------------------------------------------------------------------
+# Variables
+#------------------------------------------------------------------------------
 #
 # PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 # DISPLAY=:0.0
@@ -32,7 +35,7 @@ if [ -t 1 ]; then clear; fi # Clear screen if we have a console
 # System
 #------------------------------------------------------------------------------
 # Start the sonar if it is not running - every 5 minute.
-#*/5 * * * * pgrep -f /home/norman/bin/sonar.sh >/dev/null || /home/norman/bin/sonar.sh >/dev/null 2>&1
+# * * * * * /home/norman/bin/sonar.sh > /tmp/sonar.log 2>&1
 #------------------------------------------------------------------------------
 # End of crontab
 #------------------------------------------------------------------------------
