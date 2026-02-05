@@ -14,6 +14,29 @@ if [ -t 1 ]; then clear; fi # Clear screen if we have a console
 # 4. Allow all trafic from the client pinging to this host
 #
 # (C)opyleft 2025 - Keld Norman
+#
+# Add this to crontab to ensure the sonar script is running.
+#
+# PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+# DISPLAY=:0.0
+# XAUTHORITY=/home/norman/.Xauthority
+#
+#  * * * * *
+#  | | | | |_ Weekly 0-6 (0 Sunday)
+#  | | | |___ Monthly 1-12
+#  | | |_____ Day of month 1-31
+#  | |_______ Hour 0-23
+#  |_________ Minute 0-59
+#
+#------------------------------------------------------------------------------
+# System
+#------------------------------------------------------------------------------
+# Start the sonar if it is not running - every 5 minute.
+#*/5 * * * * pgrep -f /home/norman/bin/sonar.sh >/dev/null || /home/norman/bin/sonar.sh >/dev/null 2>&1
+#------------------------------------------------------------------------------
+# End of crontab
+#------------------------------------------------------------------------------
+#
 #---------------------------------------------------------------------------
 # Essential variable
 #---------------------------------------------------------------------------
@@ -24,15 +47,13 @@ TEMP_DIR="/tmp/${PROGNAME}"                 # Temp directory
 #---------------------------------------------------------------------------
 DEBUG=0                                     # Set to one to enable debugging
 CLEANED_UP=0                                #
+APT_UPDATED=0                               # Flag for apt-get update
 MENU_WIDTH=520                              # Width of dialog popup
-ULOGD_GROUP=42                              #
 MAIN_PID=${BASHPID}                         #
 ISOLATE_TIME_SEC=300                        # Seconds to isolate attacker
 TITLE="Sonar Ping Detected"                 #
 INCLUDE_LOCAL="${INCLUDE_LOCAL:-0}"         #
 ULOGD_CONF="${TEMP_DIR}/ulogd.conf"         #
-LOCKFILE="${TEMP_DIR}/${PROGNAME}.lock"     #
-SCRIPT_PATH="${REAL_HOME}/bin/${PROGNAME}.sh" # Where this script is located
 IGNORE_IP_LIST="${TEMP_DIR}/ignore.list"    #
 ISOLATE_MARKER_DIR="${TEMP_DIR}/isolating"  #
 #---------------------------------------------------------------------------
@@ -47,10 +68,6 @@ ALLOW_CHAIN="ICMP_WATCHER_ALLOW"            #
 BLOCK_CHAIN="ICMP_WATCHER_BLOCK"            #
 ISO_CHAIN_IN="ICMP_WATCHER_ISO_IN"          #
 ISO_CHAIN_OUT="ICMP_WATCHER_ISO_OUT"        #
-#---------------------------------------------------------------------------
-# Systemd service file name
-#---------------------------------------------------------------------------
-SERVICE_FILE="/etc/systemd/system/${PROGNAME}.service"
 #---------------------------------------------------------------------------
 # USER / DISPLAY CONTEXT
 #---------------------------------------------------------------------------
@@ -70,18 +87,43 @@ LOCAL_IPS="$(ip -o -4 addr show | awk '{print $4}' | cut -d/ -f1 | grep -v '^127
 umask 077 # Set strict umask: only the owner can read/write/execute new files/dirs
 mkdir -p -m 700 "${TEMP_DIR}" 2>/dev/null # Ensure the base directory is private
 #---------------------------------------------------------------------------
-# DEBUG
+# Check for lock file and process running
 #---------------------------------------------------------------------------
+LOCKFILE="${TEMP_DIR}/${PROGNAME}.pid"
+if [ -f "${LOCKFILE}" ]; then # There is a lockfile
+ OLD_PROCESS_PID="$(tr -d '\0' < "${LOCKFILE}" 2>/dev/null | grep -oE '[0-9]+')"
+ if [ -n "${OLD_PROCESS_PID}" ] && [ "${OLD_PROCESS_PID}" -ne "$$" ] && kill -0 "${OLD_PROCESS_PID}" 2>/dev/null; then
+  # The PID found in the lockfile is running
+  echo ""
+  echo "### ERROR - Sonar is already running with PID: ${OLD_PROCESS_PID}"
+  echo ""
+  exit 1
+ fi
+ # If it's a stale lockfile, we just continue and overwrite it later
+fi
+# Create new lock file
+if ! echo $$ > "${LOCKFILE}"; then
+ echo "### ERROR - Could not create lockfile ${LOCKFILE}"
+ exit 1
+fi
+#---------------------------------------------------------------------------
+# LOGGING REDIRECTION
+#---------------------------------------------------------------------------
+# Only the instance that successfully acquired the lock clears the logs
+sudo -n rm -f "${LOG_FILE}" 2>/dev/null
+sudo -n touch "${LOG_FILE}" 2>/dev/null
+sudo -n chmod 0644 "${LOG_FILE}" 2>/dev/null
+sudo -n chown "${REAL_USER}:${REAL_USER}" "${LOG_FILE}" 2>/dev/null
+
 if [ "${DEBUG:-0}" -eq 1 ]; then
- sudo -n rm -f "${DEBUG_LOG}" 2>/dev/null # Clean up legacy log if it exists
+ sudo -n rm -f "${DEBUG_LOG}" 2>/dev/null
  sudo -n touch "${DEBUG_LOG}" 2>/dev/null
  sudo -n chmod 0640 "${DEBUG_LOG}" 2>/dev/null
  echo "--- Script started at $(date) ---" | sudo -n tee "${DEBUG_LOG}" >/dev/null
- # Note: exec redirection to root-owned file will still fail if script is not run as root.
- # But we assume it runs as root via service or with sudo.
- exec > >(sudo -n tee -a "${DEBUG_LOG}") 2>&1
+ exec > >(sudo -n tee -a "${LOG_FILE}" | sudo -n tee -a "${DEBUG_LOG}") 2>&1
  set -x
 else
+ exec > >(sudo -n tee -a "${LOG_FILE}") 2>&1
  set +x
 fi
 #---------------------------------------------------------------------------
@@ -96,10 +138,33 @@ log_msg(){
 # DEPENDENCY CHECK
 #---------------------------------------------------------------------------
 check_sudo(){
- if ! sudo -n true 2>/dev/null; then
-  log_msg "!" "ERROR: Passwordless sudo is required for user '${REAL_USER}'."
+ local cmds=("iptables" "ip6tables" "ulogd" "nmcli" "macchanger" "pkill" "tee" "chmod" "chown" "rm" "touch" "timeout" "ettercap")
+ local missing=()
+ for cmd in "${cmds[@]}"; do
+  local fullpath
+  fullpath=$(command -v "$cmd")
+  if [ -z "$fullpath" ]; then
+   for dir in /usr/sbin /sbin /usr/local/sbin; do
+    if [ -x "$dir/$cmd" ]; then
+     fullpath="$dir/$cmd"
+     break
+    fi
+   done
+  fi
+
+  if [ -n "$fullpath" ]; then
+   if ! sudo -n "$fullpath" --version >/dev/null 2>&1 && \
+      ! sudo -n "$fullpath" -V >/dev/null 2>&1 && \
+      ! sudo -n "$fullpath" -h >/dev/null 2>&1; then
+    missing+=("$fullpath")
+   fi
+  fi
+ done
+
+ if [ ${#missing[@]} -ne 0 ]; then
+  log_msg "!" "ERROR: Passwordless sudo is required for user '${REAL_USER}' for the following commands: ${missing[*]}"
   printf "\nPlease add the following line to a file in /etc/sudoers.d/ (e.g., /etc/sudoers.d/sonar):\n"
-  printf "${REAL_USER} ALL=(ALL) NOPASSWD: /usr/sbin/iptables, /usr/sbin/ip6tables, /usr/sbin/ulogd, /usr/bin/nmcli, /usr/bin/macchanger, /usr/bin/pkill, /usr/bin/tee, /usr/bin/chmod, /usr/bin/chown, /usr/bin/rm, /usr/bin/touch\n\n"
+  printf "${REAL_USER} ALL=(ALL) NOPASSWD: /usr/sbin/iptables, /usr/sbin/ip6tables, /usr/sbin/ulogd, /usr/bin/nmcli, /usr/bin/macchanger, /usr/bin/pkill, /usr/bin/tee, /usr/bin/chmod, /usr/bin/chown, /usr/bin/rm, /usr/bin/touch, /usr/bin/timeout, /usr/sbin/ettercap\n\n"
   exit 1
  fi
 }
@@ -107,9 +172,22 @@ ensure_pkg(){
  local cmd="$1"
  local pkg="$2"
  if ! command -v "$cmd" >/dev/null 2>&1; then
-  sudo -n apt-get update -qq && sudo -n apt-get install -y "$pkg" || exit 1
-  if [ "$pkg" = "ulogd2" ]; then
-   sudo -n systemctl disable ulogd2 >/dev/null 2>&1 || true
+  printf "%-50s" "[+] Installing ${pkg}.."
+  if [ "${APT_UPDATED}" -eq 0 ]; then
+   if ! sudo -n apt-get update -qq; then
+    echo "[FAILED]"
+    exit 1
+   fi
+   APT_UPDATED=1
+  fi
+  if sudo -n apt-get install -y "$pkg" >/dev/null 2>&1; then
+   echo "[OK]"
+   if [ "$pkg" = "ulogd2" ]; then
+    sudo -n systemctl disable ulogd2 >/dev/null 2>&1 || true
+   fi
+  else
+   echo "[FAILED]"
+   exit 1
   fi
  fi
 }
@@ -135,7 +213,7 @@ ip_is_local(){
 }
 should_ignore_ip(){
  [ -s "${IGNORE_IP_LIST}" ] || return 1
- grep -q -F "$1" "${IGNORE_IP_LIST}"
+ grep -q -x -F "$1" "${IGNORE_IP_LIST}"
 }
 validate_netcard(){
  NETCARDS="$(nmcli -f DEVICE,TYPE device | egrep -v '^lo |^p2p|^DEVICE')"
@@ -198,8 +276,10 @@ remove_firewall(){
 init_firewall(){
  remove_firewall
  cleanup_detection
- rm -rf "${TEMP_DIR}"
+ # Ensure directories exist without deleting the lock file
  mkdir -p -m 700 "${ISOLATE_MARKER_DIR}"
+ # Clear only the markers and temp configs, keep the lock file and ignore list
+ rm -f "${ISOLATE_MARKER_DIR}"/* "${ULOGD_CONF}" 2>/dev/null
  for cmd in iptables ip6tables; do # Create chains
   sudo -n $cmd -N "${ALLOW_CHAIN}"
   sudo -n $cmd -N "${BLOCK_CHAIN}"
@@ -207,28 +287,33 @@ init_firewall(){
   sudo -n $cmd -N "${ISO_CHAIN_OUT}"
   sudo -n $cmd -t raw -N "${ISO_CHAIN_IN}" 2>/dev/null
   #
-  # Insert rules into INPUT in REVERSE priority order to avoid index issues
-  # Desired order: 1:ALLOW, 2:BLOCK, 3:NFLOG, 4:DROP, 5:ISO
-  #
-  # 5. Isolation (Lowest priority among our rules)
-  sudo -n $cmd -I INPUT -j "${ISO_CHAIN_IN}"
-  # 4. Stealth (DROP)
+  # Insert rules into INPUT in specific priority order (at index 1)
+  # Desired final order: 1:ALLOW, 2:ISO, 3:BLOCK, 4:NFLOG, 5:STEALTH
+
+  # 5. Stealth (Lowest priority)
   if [ "$cmd" = "iptables" ]; then
-   sudo -n $cmd -I INPUT -p icmp --icmp-type echo-request -j DROP
+   sudo -n $cmd -I INPUT 1 -p icmp --icmp-type echo-request -j DROP
   else
-   sudo -n $cmd -I INPUT -p icmpv6 --icmpv6-type echo-request -j DROP 2>/dev/null
+   sudo -n $cmd -I INPUT 1 -p icmpv6 --icmpv6-type echo-request -j DROP 2>/dev/null
   fi
-  # 3. Detection (NFLOG)
+
+  # 4. Detection (NFLOG)
   if [ "$cmd" = "iptables" ]; then
-   sudo -n $cmd -I INPUT -p icmp --icmp-type echo-request -j NFLOG --nflog-group 42
+   sudo -n $cmd -I INPUT 1 -p icmp --icmp-type echo-request -j NFLOG --nflog-group 42
   else
-   sudo -n $cmd -I INPUT -p icmpv6 --icmpv6-type echo-request -j NFLOG --nflog-group 42 2>/dev/null
+   sudo -n $cmd -I INPUT 1 -p icmpv6 --icmpv6-type echo-request -j NFLOG --nflog-group 42 2>/dev/null
   fi
-  # 2. Block
-  sudo -n $cmd -I INPUT -j "${BLOCK_CHAIN}"
+
+  # 3. Block
+  sudo -n $cmd -I INPUT 1 -j "${BLOCK_CHAIN}"
+
+  # 2. Isolation (High priority to suppress detection)
+  sudo -n $cmd -I INPUT 1 -j "${ISO_CHAIN_IN}"
+
   # 1. Allow (Highest priority)
-  sudo -n $cmd -I INPUT -j "${ALLOW_CHAIN}"
-  # Other hooks (Order doesn't matter much as these are usually empty or handled specifically)
+  sudo -n $cmd -I INPUT 1 -j "${ALLOW_CHAIN}"
+
+  # Other hooks
   sudo -n $cmd -I FORWARD 1 -j "${ISO_CHAIN_IN}"
   sudo -n $cmd -t raw -I PREROUTING 1 -j "${ISO_CHAIN_IN}" 2>/dev/null
   sudo -n $cmd -I OUTPUT 1 -j "${ISO_CHAIN_OUT}"
@@ -251,6 +336,7 @@ ensure_pkg macchanger macchanger
 ensure_pkg nmcli network-manager
 ensure_pkg ettercap ettercap-text-only
 ensure_pkg etterfilter ettercap-text-only
+ensure_pkg wmctrl wmctrl
 #---------------------------------------------------------------------------
 # AWK parser - indestructible packet boundary detection
 #---------------------------------------------------------------------------
@@ -299,11 +385,17 @@ cleanup(){
  CLEANED_UP=1
  trap - EXIT INT TERM # Silence traps to prevent recursion
  log_msg "+" "ICMP Watcher stopping..."
- ( sudo -n pkill -KILL -f "[t]imeout.*ettercap" 2>/dev/null ) 2>/dev/null
+ # Use SIGINT to allow ettercap to restore ARP cache
+ ( sudo -n pkill -INT -f "[t]imeout.*ettercap" 2>/dev/null ) 2>/dev/null
  ( sudo -n pkill -INT -f "[e]ttercap.*-M arp" 2>/dev/null ) 2>/dev/null
  ( sudo -n pkill -TERM -f "[u]logd -c ${ULOGD_CONF}" 2>/dev/null ) 2>/dev/null
  remove_firewall
  cleanup_detection
+ # Cleanup lockfile
+ OLD_PID=$(cat "${LOCKFILE}" 2>/dev/null)
+ if [ -e "${LOCKFILE}" ] && [ "$$" -eq "${OLD_PID:-0}" ]; then
+  rm "${LOCKFILE}" >/dev/null 2>&1
+ fi
  rm -rf "${TEMP_DIR}" 2>/dev/null
  [ -n "${ORIG_IP_FORWARD}" ] && echo "${ORIG_IP_FORWARD}" | sudo -n tee /proc/sys/net/ipv4/ip_forward >/dev/null 2>&1
  [ -n "${ORIG_ICMP_IGNORE}" ] && echo "${ORIG_ICMP_IGNORE}" | sudo -n tee /proc/sys/net/ipv4/icmp_echo_ignore_all >/dev/null 2>&1
@@ -312,12 +404,16 @@ cleanup(){
 #---------------------------------------------------------------------------
 # ZENITY WRAPPER (RUN AS REAL USER)
 #---------------------------------------------------------------------------
-zenity_u(){
+# Wrapper to run commands as the real user with correct X11 context
+run_u(){
  if [ "$USER" = "root" ] && [ -n "$SUDO_USER" ]; then
-  sudo -n -u "$REAL_USER" env DISPLAY="$DISPLAY_VAL" XAUTHORITY="$XAUTH_FILE" GTK_THEME="${GTK_THEME}" zenity "$@" 2>/dev/null
+  sudo -n -u "$REAL_USER" env DISPLAY="$DISPLAY_VAL" XAUTHORITY="$XAUTH_FILE" GTK_THEME="${GTK_THEME}" "$@"
  else
-  env DISPLAY="$DISPLAY_VAL" XAUTHORITY="$XAUTH_FILE" GTK_THEME="${GTK_THEME}" zenity "$@" 2>/dev/null
+  env DISPLAY="$DISPLAY_VAL" XAUTHORITY="$XAUTH_FILE" GTK_THEME="${GTK_THEME}" "$@"
  fi
+}
+zenity_u(){
+ run_u zenity "$@" 2>/dev/null
 }
 #---------------------------------------------------------------------------
 # POPUP
@@ -333,30 +429,44 @@ popup_and_act(){
  [ -f "${ISOLATE_MARKER_DIR}/${IP}" ] && return
  lock_acquire "${POPUP_LOCK}" || return
  trap 'lock_release "${POPUP_LOCK}"' EXIT
+
+ # Background task to bring the popup to front and set "Always on Top"
+ (
+  for i in {1..25}; do
+   if run_u wmctrl -l 2>/dev/null | grep -q "${TITLE}"; then
+    # -a: activate (bring to front), -b add,above: always on top
+    run_u wmctrl -r "${TITLE}" -b add,above 2>/dev/null
+    run_u wmctrl -a "${TITLE}" 2>/dev/null
+    break
+   fi
+   sleep 0.2
+  done
+ ) &
+
  same_subnet_on_iface "${IP}" && same_net=1
  if [ "${same_net}" -eq 1 ]; then
   answer="$(zenity_u --question  \
    --title="${TITLE}"            \
    --width=${MENU_WIDTH}         \
+   --ok-label="Isolate ${IP} (${ISOLATE_TIME_SEC}s)" \
+   --extra-button="Block ${IP}"  \
+   --extra-button="Stop monitoring ${IP}" \
+   --extra-button="Allow ${IP}"  \
    --extra-button="Ignore ${IP}" \
    --extra-button="Change IP"    \
    --extra-button="Go Offline"   \
-   --extra-button="Block ${IP}"  \
-   --extra-button="Allow ${IP}"  \
-   --extra-button="Stop monitoring ${IP}" \
-   --ok-label="Isolate ${IP} (${ISOLATE_TIME_SEC}s)" \
    --text="Ping from: ${IP}\nNetcard: ${NETCARD}\n\nSelect action:" \
    --cancel-label="Cancel")"
  else
   answer="$(zenity_u --question  \
    --title="${TITLE}"            \
    --width=${MENU_WIDTH}         \
-   --extra-button="Ignore ${IP}" \
    --ok-label="Block ${IP}"      \
+   --extra-button="Stop monitoring ${IP}" \
+   --extra-button="Allow ${IP}"  \
+   --extra-button="Ignore ${IP}" \
    --extra-button="Change IP"    \
    --extra-button="Go Offline"   \
-   --extra-button="Allow ${IP}"  \
-   --extra-button="Stop monitoring ${IP}" \
    --text="Ping from: ${IP}\nNetcard: ${NETCARD}\n\nSelect action:" \
    --cancel-label="Cancel")"
  fi
@@ -454,7 +564,8 @@ EOF
 		  sudo -n iptables -D "${ISO_CHAIN_OUT}" -d "${IP}" -j DROP 2>/dev/null
 		  sudo rm -f "${FILTER_SRC}" "${FILTER_BIN}"
 		  # Remove from ignore list when isolation ends
-		  sed -i "/^${IP}$/d" "${IGNORE_IP_LIST}" 2>/dev/null
+		  local ESC_IP=$(echo "${IP}" | sed 's/\./\\./g')
+		  sed -i "/^${ESC_IP}$/d" "${IGNORE_IP_LIST}" 2>/dev/null
 		  rm -f "${ISOLATE_MARKER_DIR}/${IP}"
 		  log_msg "+" "Stopped isolation of ${IP} on ${NETCARD}"
 		 ) &
@@ -510,6 +621,9 @@ main(){
   fi
   should_ignore_ip "${SRC}" && continue
   [ -f "${ISOLATE_MARKER_DIR}/${SRC}" ] && continue
+  # Suppress if a popup for this IP is already active
+  [ -f "${TEMP_DIR}/popup.${SRC}.lock" ] && continue
+
   log_msg "!" "Ping detected from ${SRC} on ${IFACE}"
   popup_and_act "${SRC}" "${IFACE}" &
   disown
