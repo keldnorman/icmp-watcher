@@ -1,5 +1,5 @@
 #!/bin/bash
-if [ -t 1 ]; then clear; fi # Clear screen if we have a console
+if [ -t 1 ]; then clear; fi # Clear screen if the script runs on a console
 #---------------------------------------------------------------------------
 # Sonar - Version 1.0 Initial version
 #---------------------------------------------------------------------------
@@ -16,9 +16,6 @@ if [ -t 1 ]; then clear; fi # Clear screen if we have a console
 # (C)opyleft 2025 - Keld Norman
 #
 # Add this to crontab to ensure the sonar script is running.
-#------------------------------------------------------------------------------
-# Variables
-#------------------------------------------------------------------------------
 #
 # PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 # DISPLAY=:0.0
@@ -34,8 +31,8 @@ if [ -t 1 ]; then clear; fi # Clear screen if we have a console
 #------------------------------------------------------------------------------
 # System
 #------------------------------------------------------------------------------
-# Start the sonar if it is not running - every 5 minute.
-# * * * * * /home/norman/bin/sonar.sh > /tmp/sonar.log 2>&1
+# Check every minute if the sonar process is running as it should.
+# * * * * * /home/norman/bin/sonar.sh > /dev/null 2>&1
 #------------------------------------------------------------------------------
 # End of crontab
 #------------------------------------------------------------------------------
@@ -102,7 +99,6 @@ if [ -f "${LOCKFILE}" ]; then # There is a lockfile
   echo ""
   exit 1
  fi
- # If it's a stale lockfile, we just continue and overwrite it later
 fi
 # Create new lock file
 if ! echo $$ > "${LOCKFILE}"; then
@@ -117,7 +113,6 @@ sudo -n rm -f "${LOG_FILE}" 2>/dev/null
 sudo -n touch "${LOG_FILE}" 2>/dev/null
 sudo -n chmod 0644 "${LOG_FILE}" 2>/dev/null
 sudo -n chown "${REAL_USER}:${REAL_USER}" "${LOG_FILE}" 2>/dev/null
-
 if [ "${DEBUG:-0}" -eq 1 ]; then
  sudo -n rm -f "${DEBUG_LOG}" 2>/dev/null
  sudo -n touch "${DEBUG_LOG}" 2>/dev/null
@@ -154,7 +149,6 @@ check_sudo(){
     fi
    done
   fi
-
   if [ -n "$fullpath" ]; then
    if ! sudo -n "$fullpath" --version >/dev/null 2>&1 && \
       ! sudo -n "$fullpath" -V >/dev/null 2>&1 && \
@@ -163,7 +157,6 @@ check_sudo(){
    fi
   fi
  done
-
  if [ ${#missing[@]} -ne 0 ]; then
   log_msg "!" "ERROR: Passwordless sudo is required for user '${REAL_USER}' for the following commands: ${missing[*]}"
   printf "\nPlease add the following line to a file in /etc/sudoers.d/ (e.g., /etc/sudoers.d/sonar):\n"
@@ -292,30 +285,24 @@ init_firewall(){
   #
   # Insert rules into INPUT in specific priority order (at index 1)
   # Desired final order: 1:ALLOW, 2:ISO, 3:BLOCK, 4:NFLOG, 5:STEALTH
-
   # 5. Stealth (Lowest priority)
   if [ "$cmd" = "iptables" ]; then
    sudo -n $cmd -I INPUT 1 -p icmp --icmp-type echo-request -j DROP
   else
    sudo -n $cmd -I INPUT 1 -p icmpv6 --icmpv6-type echo-request -j DROP 2>/dev/null
   fi
-
   # 4. Detection (NFLOG)
   if [ "$cmd" = "iptables" ]; then
    sudo -n $cmd -I INPUT 1 -p icmp --icmp-type echo-request -j NFLOG --nflog-group 42
   else
    sudo -n $cmd -I INPUT 1 -p icmpv6 --icmpv6-type echo-request -j NFLOG --nflog-group 42 2>/dev/null
   fi
-
   # 3. Block
   sudo -n $cmd -I INPUT 1 -j "${BLOCK_CHAIN}"
-
   # 2. Isolation (High priority to suppress detection)
   sudo -n $cmd -I INPUT 1 -j "${ISO_CHAIN_IN}"
-
   # 1. Allow (Highest priority)
   sudo -n $cmd -I INPUT 1 -j "${ALLOW_CHAIN}"
-
   # Other hooks
   sudo -n $cmd -I FORWARD 1 -j "${ISO_CHAIN_IN}"
   sudo -n $cmd -t raw -I PREROUTING 1 -j "${ISO_CHAIN_IN}" 2>/dev/null
@@ -323,7 +310,7 @@ init_firewall(){
  done
 }
 #---------------------------------------------------------------------------
-#
+# Install missing packages
 #---------------------------------------------------------------------------
 ensure_pkg sed sed
 ensure_pkg awk gawk
@@ -358,17 +345,14 @@ function process() {
 /^ip.daddr.str=/ { dst=$0;   sub(/^ip.daddr.str=[ \t]*/, "", dst) }
 /^icmp.type=/    { type=$0;  sub(/^icmp.type=[ \t]*/, "", type) }
 END { process() }'
-
 init_detection(){
  # Prepare ulogd config
  cat <<EOF > "${ULOGD_CONF}"
 [global]
 logfile="/dev/null"
 stack=log1:NFLOG,base1:BASE,ifi1:IFINDEX,ip2str1:IP2STR,op1:OPRINT
-
 [log1]
 group=42
-
 [op1]
 file="/dev/stdout"
 sync=1
@@ -389,9 +373,9 @@ cleanup(){
  trap - EXIT INT TERM # Silence traps to prevent recursion
  log_msg "+" "ICMP Watcher stopping..."
  # Use SIGINT to allow ettercap to restore ARP cache
- ( sudo -n pkill -INT -f "[t]imeout.*ettercap" 2>/dev/null ) 2>/dev/null
- ( sudo -n pkill -INT -f "[e]ttercap.*-M arp" 2>/dev/null ) 2>/dev/null
- ( sudo -n pkill -TERM -f "[u]logd -c ${ULOGD_CONF}" 2>/dev/null ) 2>/dev/null
+ sudo -n pkill -INT -f "[t]imeout.*ettercap" 2>/dev/null || true
+ sudo -n pkill -INT -f "[e]ttercap.*-M arp" 2>/dev/null || true
+ sudo -n pkill -TERM -f "[u]logd -c ${ULOGD_CONF}" 2>/dev/null || true
  remove_firewall
  cleanup_detection
  # Cleanup lockfile
@@ -432,7 +416,6 @@ popup_and_act(){
  [ -f "${ISOLATE_MARKER_DIR}/${IP}" ] && return
  lock_acquire "${POPUP_LOCK}" || return
  trap 'lock_release "${POPUP_LOCK}"' EXIT
-
  # Background task to bring the popup to front and set "Always on Top"
  (
   for i in {1..25}; do
@@ -445,7 +428,6 @@ popup_and_act(){
    sleep 0.2
   done
  ) &
-
  same_subnet_on_iface "${IP}" && same_net=1
  if [ "${same_net}" -eq 1 ]; then
   answer="$(zenity_u --question  \
@@ -592,11 +574,13 @@ EOF
 # MAIN
 #---------------------------------------------------------------------------
 main(){
+ set +m
+ shopt -s lastpipe
  check_sudo
  log_msg "+" "ICMP Watcher starting..."
  # Cleanup any stale processes from previous runs.
- ( sudo -n pkill -KILL -f "[t]imeout.*ettercap" 2>/dev/null ) 2>/dev/null
- ( sudo -n pkill -INT -f "[e]ttercap.*-M arp" 2>/dev/null ) 2>/dev/null
+ sudo -n pkill -KILL -f "[t]imeout.*ettercap" 2>/dev/null || true
+ sudo -n pkill -INT -f "[e]ttercap.*-M arp" 2>/dev/null || true
  # Enable IP forwarding for MITM and ENSURE local ICMP responses are enabled
  log_msg "+" "Enabling IP forwarding and ICMP responses..."
  echo 1 | sudo -n tee /proc/sys/net/ipv4/ip_forward >/dev/null 2>&1
@@ -606,17 +590,15 @@ main(){
  init_detection
  pick_gtk_theme
  log_msg "+" "Monitoring ${LOCAL_IPS} for ICMP pings (NFLOG group 42)..."
- # Start ulogd
- ULOGD_REDIR="/dev/null"
+ # Start ulogd and the detection loop
  if [ "${DEBUG:-0}" -eq 1 ]; then
   sudo -n touch "${DEBUG_LOG}" 2>/dev/null
   sudo -n chmod 0640 "${DEBUG_LOG}" 2>/dev/null
-  ULOGD_REDIR="${DEBUG_LOG}"
- fi
- sudo -n bash -c "ulogd -c '${ULOGD_CONF}' -v 2>> '${ULOGD_REDIR}'" | awk "${ULOGD_AWK_SCRIPT}" | \
- (
-  trap - EXIT INT TERM; while read -r IFACE SRC DST; do
-  [ "$DEBUG" -eq 1 ] && printf "DEBUG: Received from parser: IFACE=%s SRC=%s DST=%s\n" "$IFACE" "$SRC" "$DST" >&2
+  sudo -n bash -c "exec ulogd -c '${ULOGD_CONF}' -v 2>> '${DEBUG_LOG}'"
+ else
+  sudo -n ulogd -c "${ULOGD_CONF}" -v 2>/dev/null
+ fi | awk "${ULOGD_AWK_SCRIPT}" | \
+ while read -r IFACE SRC DST; do
   [ -n "${SRC}" ] || continue
   if [ "${INCLUDE_LOCAL}" != "1" ]; then
    [ "${IFACE}" = "lo" ] && continue
@@ -624,14 +606,11 @@ main(){
   fi
   should_ignore_ip "${SRC}" && continue
   [ -f "${ISOLATE_MARKER_DIR}/${SRC}" ] && continue
-  # Suppress if a popup for this IP is already active
   [ -f "${TEMP_DIR}/popup.${SRC}.lock" ] && continue
-
   log_msg "!" "Ping detected from ${SRC} on ${IFACE}"
   popup_and_act "${SRC}" "${IFACE}" &
   disown
-  done
- )
+ done
 }
 trap cleanup EXIT INT TERM
 if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
