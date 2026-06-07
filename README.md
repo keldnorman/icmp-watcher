@@ -3,3 +3,8 @@ Watches for icmp (ping) and react accordently by blocking, isolating or taking o
 ![alt text](https://github.com/keldnorman/icmp-watcher/blob/main/sonar.png?raw=true)
 
 ### --> [Watch the video](https://www.youtube.com/watch?v=BFnXcDRCp7k) <-- ###
+
+## Buy me a cup of coffee ?
+
+If you like this project and wants to give me a cup of coffee:
+https://buymeacoffee.com/keldnormanh
